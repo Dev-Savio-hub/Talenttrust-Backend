@@ -44,11 +44,42 @@ export interface EscrowContract {
   updatedAt: string;
 }
 
+export type RatingHistogram = [number, number, number, number, number];
+
+export type ReputationSort = 'score' | 'completed' | 'average';
+
 export interface Reputation {
   address: string;
   completedContracts: number;
   totalRating: number;
   averageRating: number;
+  score: number;
+  rank: number | null;
+  histogram: RatingHistogram;
+  lastRatedAt: string | null;
+}
+
+export interface ReputationPage {
+  data: Reputation[];
+  page: {
+    limit: number;
+    nextCursor: string | null;
+    hasMore: boolean;
+  };
+}
+
+interface ReputationRecord {
+  completed: number;
+  total: number;
+  histogram: RatingHistogram;
+  lastRatedAt: string | null;
+}
+
+interface LeaderboardCache {
+  priorWeight: number;
+  globalMean: number;
+  bySort: Record<ReputationSort, Reputation[]>;
+  byAddress: Map<string, Reputation>;
 }
 
 export class HttpError extends Error {
@@ -63,11 +94,48 @@ export class HttpError extends Error {
 
 const MAX_MILESTONES = 20;
 const ACTIVE: ContractStatus[] = ['Created', 'Funded'];
+const REPUTATION_SORTS: ReputationSort[] = ['score', 'completed', 'average'];
+
+const round2 = (n: number): number => Math.round(n * 100) / 100;
+
+const parsePriorWeight = (override?: number): number => {
+  if (override !== undefined) return override;
+  const raw = process.env.REPUTATION_PRIOR_WEIGHT;
+  if (raw === undefined || raw === '') return 5;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 5;
+};
+
+const encodeCursor = (sort: ReputationSort, address: string): string =>
+  Buffer.from(JSON.stringify({ sort, address }), 'utf8').toString('base64url');
+
+const decodeCursor = (cursor: string, expectedSort: ReputationSort): string => {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
+  } catch {
+    throw new HttpError(400, 'invalid_cursor', 'cursor is malformed');
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    throw new HttpError(400, 'invalid_cursor', 'cursor is malformed');
+  }
+  const { sort, address } = parsed as { sort?: unknown; address?: unknown };
+  if (sort !== expectedSort || typeof address !== 'string' || !address) {
+    throw new HttpError(400, 'invalid_cursor', 'cursor does not match query');
+  }
+  return address;
+};
 
 export class EscrowStore {
   private contracts = new Map<number, EscrowContract>();
-  private reputation = new Map<string, { completed: number; total: number }>();
+  private reputation = new Map<string, ReputationRecord>();
+  private leaderboardCache: LeaderboardCache | null = null;
   private nextId = 1;
+  private priorWeightOverride?: number;
+
+  constructor(options?: { priorWeight?: number }) {
+    this.priorWeightOverride = options?.priorWeight;
+  }
 
   list(filter: { status?: string; party?: string } = {}): EscrowContract[] {
     return [...this.contracts.values()].filter(
@@ -231,22 +299,178 @@ export class EscrowStore {
     if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
       throw new HttpError(400, 'invalid_rating', 'rating must be an integer 1..5');
     }
-    const r = this.reputation.get(c.freelancer) ?? { completed: 0, total: 0 };
+    const now = new Date().toISOString();
+    const r = this.reputation.get(c.freelancer) ?? {
+      completed: 0,
+      total: 0,
+      histogram: [0, 0, 0, 0, 0] as RatingHistogram,
+      lastRatedAt: null,
+    };
     r.completed += 1;
     r.total += rating;
+    r.histogram[rating - 1] += 1;
+    r.lastRatedAt = now;
     this.reputation.set(c.freelancer, r);
+    this.leaderboardCache = null;
     c.reputationIssued = true;
     this.touch(c);
     return this.getReputation(c.freelancer);
   }
 
+  private getLeaderboardCache(): LeaderboardCache {
+    const C = parsePriorWeight(this.priorWeightOverride);
+    if (this.leaderboardCache && this.leaderboardCache.priorWeight === C) {
+      return this.leaderboardCache;
+    }
+
+    let globalTotal = 0;
+    let globalCompleted = 0;
+    for (const r of this.reputation.values()) {
+      globalTotal += r.total;
+      globalCompleted += r.completed;
+    }
+    const m = globalCompleted > 0 ? globalTotal / globalCompleted : 3;
+
+    const entries: Reputation[] = [];
+    for (const [address, r] of this.reputation.entries()) {
+      if (r.completed < 1) continue;
+      const averageRating = round2(r.total / r.completed);
+      const score = round2((C * m + r.total) / (C + r.completed));
+      entries.push({
+        address,
+        completedContracts: r.completed,
+        totalRating: r.total,
+        averageRating,
+        score,
+        rank: null,
+        histogram: [...r.histogram] as RatingHistogram,
+        lastRatedAt: r.lastRatedAt,
+      });
+    }
+
+    const tieBreak = (a: Reputation, b: Reputation) => {
+      if (b.completedContracts !== a.completedContracts) {
+        return b.completedContracts - a.completedContracts;
+      }
+      return a.address.localeCompare(b.address);
+    };
+
+    const byScore = [...entries].sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return tieBreak(a, b);
+    });
+
+    const byAddress = new Map<string, Reputation>();
+    byScore.forEach((entry, idx) => {
+      entry.rank = idx + 1;
+      byAddress.set(entry.address, entry);
+    });
+
+    const byCompleted = [...byScore].sort((a, b) => tieBreak(a, b));
+    const byAverage = [...byScore].sort((a, b) => {
+      if (b.averageRating !== a.averageRating) return b.averageRating - a.averageRating;
+      return tieBreak(a, b);
+    });
+
+    this.leaderboardCache = {
+      priorWeight: C,
+      globalMean: m,
+      bySort: {
+        score: byScore,
+        completed: byCompleted,
+        average: byAverage,
+      },
+      byAddress,
+    };
+    return this.leaderboardCache;
+  }
+
+  private cloneReputation(r: Reputation): Reputation {
+    return {
+      ...r,
+      histogram: [...r.histogram] as RatingHistogram,
+    };
+  }
+
   getReputation(address: string): Reputation {
-    const r = this.reputation.get(address) ?? { completed: 0, total: 0 };
+    const cache = this.getLeaderboardCache();
+    const cached = cache.byAddress.get(address);
+    if (cached) {
+      return this.cloneReputation(cached);
+    }
     return {
       address,
-      completedContracts: r.completed,
-      totalRating: r.total,
-      averageRating: r.completed ? Math.round((r.total / r.completed) * 100) / 100 : 0,
+      completedContracts: 0,
+      totalRating: 0,
+      averageRating: 0,
+      score: cache.priorWeight > 0 ? round2(cache.globalMean) : 0,
+      rank: null,
+      histogram: [0, 0, 0, 0, 0],
+      lastRatedAt: null,
+    };
+  }
+
+  listReputation(query: {
+    sort?: unknown;
+    minCompleted?: unknown;
+    limit?: unknown;
+    cursor?: unknown;
+  } = {}): ReputationPage {
+    const sortRaw = query.sort === undefined || query.sort === '' ? 'score' : query.sort;
+    if (typeof sortRaw !== 'string' || !REPUTATION_SORTS.includes(sortRaw as ReputationSort)) {
+      throw new HttpError(400, 'invalid_sort', 'sort must be one of score, completed, average');
+    }
+    const sort = sortRaw as ReputationSort;
+
+    let minCompleted = 1;
+    if (query.minCompleted !== undefined && query.minCompleted !== '') {
+      const n = Number(query.minCompleted);
+      if (!Number.isInteger(n) || n < 0) {
+        throw new HttpError(400, 'invalid_min_completed', 'minCompleted must be a non-negative integer');
+      }
+      minCompleted = n;
+    }
+
+    let limit = 20;
+    if (query.limit !== undefined && query.limit !== '') {
+      const n = Number(query.limit);
+      if (!Number.isInteger(n) || n < 1 || n > 100) {
+        throw new HttpError(400, 'invalid_limit', 'limit must be an integer 1..100');
+      }
+      limit = n;
+    }
+
+    let cursorAddress: string | undefined;
+    if (query.cursor !== undefined && query.cursor !== '') {
+      if (typeof query.cursor !== 'string') {
+        throw new HttpError(400, 'invalid_cursor', 'cursor must be a string');
+      }
+      cursorAddress = decodeCursor(query.cursor, sort);
+    }
+
+    const cache = this.getLeaderboardCache();
+    const filtered = cache.bySort[sort].filter((r) => r.completedContracts >= minCompleted);
+
+    let startIndex = 0;
+    if (cursorAddress !== undefined) {
+      const idx = filtered.findIndex((r) => r.address === cursorAddress);
+      if (idx === -1) {
+        throw new HttpError(400, 'invalid_cursor', 'cursor not found in result set');
+      }
+      startIndex = idx + 1;
+    }
+
+    const slice = filtered.slice(startIndex, startIndex + limit);
+    const hasMore = startIndex + limit < filtered.length;
+    const nextCursor = hasMore && slice.length > 0 ? encodeCursor(sort, slice[slice.length - 1].address) : null;
+
+    return {
+      data: slice.map((r) => this.cloneReputation(r)),
+      page: {
+        limit,
+        nextCursor,
+        hasMore,
+      },
     };
   }
 

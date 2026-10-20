@@ -6,6 +6,10 @@ const ok = (description: string, schema: object = { type: 'object' }) => ({
 });
 const idParam = { name: 'id', in: 'path', required: true, schema: { type: 'integer' } };
 const contractRef = { $ref: '#/components/schemas/EscrowContract' };
+const reputationRef = { $ref: '#/components/schemas/Reputation' };
+const reputationPageRef = { $ref: '#/components/schemas/ReputationPage' };
+const errorRef = { $ref: '#/components/schemas/Error' };
+const err = (description: string) => ({ description, content: json(errorRef) });
 
 export const openapi = {
   openapi: '3.0.3',
@@ -106,8 +110,56 @@ export const openapi = {
         tags: ['Reputation'],
         summary: 'Rate the freelancer of a completed contract',
         parameters: [idParam],
-        requestBody: { content: json({ type: 'object', properties: { rating: { type: 'integer', minimum: 1, maximum: 5 } } }) },
-        responses: ok('Reputation'),
+        requestBody: {
+          required: true,
+          content: json({
+            type: 'object',
+            required: ['rating'],
+            properties: { rating: { type: 'integer', minimum: 1, maximum: 5 } },
+          }),
+        },
+        responses: {
+          ...ok('Reputation', reputationRef),
+          400: err('Invalid contract id or rating'),
+          404: err('Contract not found'),
+          409: err('Contract is not completed or reputation already issued'),
+        },
+      },
+    },
+    '/api/v1/reputation': {
+      get: {
+        tags: ['Reputation'],
+        summary: 'Ranked freelancer reputation leaderboard',
+        parameters: [
+          {
+            name: 'sort',
+            in: 'query',
+            schema: { type: 'string', enum: ['score', 'completed', 'average'], default: 'score' },
+            description: 'Sort order for the leaderboard',
+          },
+          {
+            name: 'minCompleted',
+            in: 'query',
+            schema: { type: 'integer', minimum: 0, default: 1 },
+            description: 'Minimum number of rated completed contracts',
+          },
+          {
+            name: 'limit',
+            in: 'query',
+            schema: { type: 'integer', minimum: 1, maximum: 100, default: 20 },
+            description: 'Page size (1..100)',
+          },
+          {
+            name: 'cursor',
+            in: 'query',
+            schema: { type: 'string' },
+            description: 'Opaque pagination cursor from a previous page response',
+          },
+        ],
+        responses: {
+          ...ok('Reputation leaderboard page', reputationPageRef),
+          400: err('Invalid query parameter or cursor'),
+        },
       },
     },
     '/api/v1/reputation/{address}': {
@@ -115,7 +167,7 @@ export const openapi = {
         tags: ['Reputation'],
         summary: 'Get freelancer reputation',
         parameters: [{ name: 'address', in: 'path', required: true, schema: { type: 'string' } }],
-        responses: ok('Reputation'),
+        responses: ok('Reputation', reputationRef),
       },
     },
   },
@@ -145,6 +197,59 @@ export const openapi = {
           fundedAmount: { type: 'number' },
           releasedAmount: { type: 'number' },
           status: { type: 'string', enum: ['Created', 'Funded', 'Completed', 'Disputed', 'Resolved', 'Cancelled'] },
+        },
+      },
+      Reputation: {
+        type: 'object',
+        required: [
+          'address',
+          'completedContracts',
+          'totalRating',
+          'averageRating',
+          'score',
+          'rank',
+          'histogram',
+          'lastRatedAt',
+        ],
+        properties: {
+          address: { type: 'string' },
+          completedContracts: { type: 'integer', minimum: 0 },
+          totalRating: { type: 'integer', minimum: 0 },
+          averageRating: { type: 'number', minimum: 0, maximum: 5 },
+          score: { type: 'number', minimum: 0, maximum: 5 },
+          rank: { type: 'integer', minimum: 1, nullable: true },
+          histogram: {
+            type: 'array',
+            minItems: 5,
+            maxItems: 5,
+            items: { type: 'integer', minimum: 0 },
+            description: 'Counts of [1★, 2★, 3★, 4★, 5★] ratings',
+          },
+          lastRatedAt: { type: 'string', format: 'date-time', nullable: true },
+        },
+      },
+      ReputationPage: {
+        type: 'object',
+        required: ['data', 'page'],
+        properties: {
+          data: { type: 'array', items: reputationRef },
+          page: {
+            type: 'object',
+            required: ['limit', 'nextCursor', 'hasMore'],
+            properties: {
+              limit: { type: 'integer', minimum: 1, maximum: 100 },
+              nextCursor: { type: 'string', nullable: true },
+              hasMore: { type: 'boolean' },
+            },
+          },
+        },
+      },
+      Error: {
+        type: 'object',
+        required: ['error', 'message'],
+        properties: {
+          error: { type: 'string' },
+          message: { type: 'string' },
         },
       },
     },

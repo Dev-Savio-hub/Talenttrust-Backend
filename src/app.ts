@@ -56,6 +56,7 @@ export function createApp(store: EscrowStore = new EscrowStore().seed()) {
         'POST /api/v1/contracts/:id/resolve',
         'POST /api/v1/contracts/:id/cancel',
         'POST /api/v1/contracts/:id/reputation',
+        'GET  /api/v1/reputation',
         'GET  /api/v1/reputation/:address',
       ],
     })),
@@ -116,6 +117,17 @@ export function createApp(store: EscrowStore = new EscrowStore().seed()) {
   v1.post('/contracts/:id/resolve', wrap((req) => store.resolveDispute(id(req), req.body?.freelancerBps)));
   v1.post('/contracts/:id/cancel', wrap((req) => store.cancel(id(req))));
   v1.post('/contracts/:id/reputation', wrap((req) => store.rate(id(req), req.body?.rating)));
+  v1.get(
+    '/reputation',
+    wrap((req) =>
+      store.listReputation({
+        sort: req.query.sort,
+        minCompleted: req.query.minCompleted,
+        limit: req.query.limit,
+        cursor: req.query.cursor,
+      }),
+    ),
+  );
   v1.get('/reputation/:address', wrap((req) => store.getReputation(req.params.address)));
   app.use('/api/v1', v1);
 

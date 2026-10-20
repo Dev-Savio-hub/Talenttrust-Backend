@@ -34,7 +34,8 @@ data is per-instance and resets on redeploy.
 | POST | `/api/v1/contracts/:id/resolve` | `{ "freelancerBps": 5000 }` |
 | POST | `/api/v1/contracts/:id/cancel` | Cancel and refund |
 | POST | `/api/v1/contracts/:id/reputation` | `{ "rating": 5 }` |
-| GET | `/api/v1/reputation/:address` | Freelancer reputation |
+| GET | `/api/v1/reputation` | Ranked freelancer leaderboard (`?sort=score\|completed\|average&minCompleted=&limit=&cursor=`) |
+| GET | `/api/v1/reputation/:address` | Freelancer reputation (`score`, `rank`, `histogram`, `lastRatedAt`) |
 
 ## Development
 
@@ -47,7 +48,7 @@ npm run build && npm start
 ```
 
 Configuration (all optional, see `.env.example`): `PORT`, `ESCROW_CONTRACT_ID`, `STELLAR_NETWORK`,
-`STELLAR_RPC_URL`, `FRONTEND_URL`.
+`STELLAR_RPC_URL`, `FRONTEND_URL`, `REPUTATION_PRIOR_WEIGHT`.
 
 ## Deployment
 
