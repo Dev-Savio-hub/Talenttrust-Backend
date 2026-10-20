@@ -35,6 +35,9 @@ data is per-instance and resets on redeploy.
 | POST | `/api/v1/contracts/:id/cancel` | Cancel and refund |
 | POST | `/api/v1/contracts/:id/reputation` | `{ "rating": 5 }` |
 | GET | `/api/v1/reputation/:address` | Freelancer reputation |
+| POST | `/api/v1/tx/submit` | Validate and relay a signed escrow transaction (`{ "xdr": "..." }`) |
+| GET | `/api/v1/tx` | List recent relayed transactions (`?limit=`) |
+| GET | `/api/v1/tx/:hash` | Get transaction status, decoded `returnValue`, and `contractError` (`?wait=true` long-polls up to 20s) |
 
 ## Development
 
@@ -47,7 +50,7 @@ npm run build && npm start
 ```
 
 Configuration (all optional, see `.env.example`): `PORT`, `ESCROW_CONTRACT_ID`, `STELLAR_NETWORK`,
-`STELLAR_RPC_URL`, `FRONTEND_URL`.
+`STELLAR_NETWORK_PASSPHRASE`, `STELLAR_RPC_URL`, `FRONTEND_URL`, `TX_CACHE_MAX`.
 
 ## Deployment
 

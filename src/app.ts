@@ -4,6 +4,7 @@ import helmet from 'helmet';
 import { config, explorerUrl } from './config';
 import { EscrowStore, HttpError } from './store';
 import { openapi, docsHtml } from './openapi';
+import { TxRelay } from './tx';
 
 const startedAt = Date.now();
 
@@ -11,6 +12,14 @@ type Handler = (req: Request, res: Response) => unknown;
 const wrap = (fn: Handler) => (req: Request, res: Response, next: NextFunction) => {
   try {
     const out = fn(req, res);
+    if (out && typeof (out as Promise<unknown>).then === 'function') {
+      (out as Promise<unknown>)
+        .then((resolved) => {
+          if (resolved !== undefined && !res.headersSent) res.json(resolved);
+        })
+        .catch(next);
+      return;
+    }
     if (out !== undefined && !res.headersSent) res.json(out);
   } catch (err) {
     next(err);
@@ -23,7 +32,12 @@ const id = (req: Request) => {
   return n;
 };
 
-export function createApp(store: EscrowStore = new EscrowStore().seed()) {
+const HEX64_RE = /^[0-9a-fA-F]{64}$/;
+
+export function createApp(
+  store: EscrowStore = new EscrowStore().seed(),
+  txRelay: TxRelay = new TxRelay(),
+) {
   const app = express();
   app.disable('x-powered-by');
   // CSP disabled so the /docs page can load Swagger UI from a CDN.
@@ -57,6 +71,9 @@ export function createApp(store: EscrowStore = new EscrowStore().seed()) {
         'POST /api/v1/contracts/:id/cancel',
         'POST /api/v1/contracts/:id/reputation',
         'GET  /api/v1/reputation/:address',
+        'POST /api/v1/tx/submit',
+        'GET  /api/v1/tx',
+        'GET  /api/v1/tx/:hash',
       ],
     })),
   );
@@ -117,6 +134,67 @@ export function createApp(store: EscrowStore = new EscrowStore().seed()) {
   v1.post('/contracts/:id/cancel', wrap((req) => store.cancel(id(req))));
   v1.post('/contracts/:id/reputation', wrap((req) => store.rate(id(req), req.body?.rating)));
   v1.get('/reputation/:address', wrap((req) => store.getReputation(req.params.address)));
+
+  v1.post(
+    '/tx/submit',
+    wrap(async (req, res) => {
+      const result = await txRelay.submit(req.body?.xdr);
+      if (result.retryAfter !== undefined) {
+        res.setHeader('Retry-After', String(result.retryAfter));
+      }
+      res.status(result.httpStatus).json(result.body);
+    }),
+  );
+
+  v1.get(
+    '/tx',
+    wrap((req) => ({
+      data: txRelay.listRecent(req.query.limit),
+    })),
+  );
+
+  v1.get(
+    '/tx/:hash',
+    wrap(async (req, res) => {
+      const hash = req.params.hash;
+      if (!HEX64_RE.test(hash)) {
+        throw new HttpError(400, 'invalid_hash', 'Transaction hash must be a 64-character hex string');
+      }
+      const waitParam = req.query.wait;
+      const shouldWait = waitParam === 'true' || waitParam === '1';
+      if (!shouldWait) {
+        return txRelay.getStatus(hash);
+      }
+
+      let disconnected = false;
+      const listeners = new Set<() => void>();
+      const onClose = () => {
+        if (res.writableEnded) return;
+        disconnected = true;
+        for (const cb of listeners) cb();
+      };
+      req.on('aborted', onClose);
+      res.on('close', onClose);
+
+      try {
+        const result = await txRelay.getStatusWithWait(
+          hash,
+          () => disconnected || req.destroyed,
+          (cb) => {
+            listeners.add(cb);
+            return () => listeners.delete(cb);
+          },
+        );
+        if (!disconnected && !res.headersSent) {
+          res.json(result);
+        }
+      } finally {
+        req.off('aborted', onClose);
+        res.off('close', onClose);
+      }
+    }),
+  );
+
   app.use('/api/v1', v1);
 
   app.use((req, res) => {
@@ -126,7 +204,7 @@ export function createApp(store: EscrowStore = new EscrowStore().seed()) {
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
     if (err instanceof HttpError) {
-      res.status(err.status).json({ error: err.code, message: err.message });
+      res.status(err.status).json({ error: err.code, message: err.message, ...(err.details ?? {}) });
       return;
     }
     if (err && typeof err === 'object' && (err as { type?: string }).type === 'entity.parse.failed') {
