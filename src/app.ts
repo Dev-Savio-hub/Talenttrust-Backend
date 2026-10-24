@@ -1,11 +1,14 @@
 import express, { NextFunction, Request, Response } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
+import compression from 'compression';
 import { config, explorerUrl } from './config';
 import { EscrowStore, HttpError } from './store';
 import { openapi, docsHtml } from './openapi';
+import { parseFieldSpec, project } from './utils/project';
 import { createLogger, type Logger, randomUUID } from './logger';
 import { ChainReader, SorobanRpcChainReader } from './chain';
+import { bigIntReplacer } from './amount';
 
 declare global {
   namespace Express {
@@ -14,6 +17,7 @@ declare global {
     }
   }
 }
+import { idempotency, IdempotencyStore, MemoryIdempotencyStore } from './idempotency';
 
 const startedAt = Date.now();
 
@@ -23,7 +27,12 @@ type Handler = (req: Request, res: Response) => unknown | Promise<unknown>;
 const wrap = (fn: Handler) => async (req: Request, res: Response, next: NextFunction) => {
   try {
     const out = await fn(req, res);
-    if (out !== undefined && !res.headersSent) res.json(out);
+    if (out !== undefined && !res.headersSent) {
+      // Use bigIntReplacer so bigint amounts serialise as decimal strings
+      // and JSON.stringify never throws on a response. Go through res.json so
+      // middleware that wraps it (idempotency replay) still sees the body.
+      res.json(JSON.parse(JSON.stringify(out, bigIntReplacer)));
+    }
   } catch (err) {
     next(err);
   }
@@ -34,6 +43,18 @@ const id = (req: Request) => {
   if (!Number.isInteger(n) || n < 1) throw new HttpError(400, 'invalid_id', 'id must be a positive integer');
   return n;
 };
+
+const optionalString = (v: unknown) => (typeof v === 'string' && v.length > 0 ? v : undefined);
+
+/**
+ * Parse the `?fields=` query param.  Returns `null` when the param is absent
+ * (meaning "return all fields").  Throws {@link HttpError} 400 on invalid input.
+ */
+function parseFields(req: Request) {
+  const raw = req.query.fields;
+  if (typeof raw !== 'string') return null;
+  return parseFieldSpec(raw);
+}
 
 const REQUEST_ID_RE = /^[A-Za-z0-9._-]{8,128}$/;
 
@@ -56,9 +77,15 @@ function resolveStoreAndLogger(
   };
 }
 
+export interface AppOptions {
+  idempotencyStore?: IdempotencyStore;
+  idempotencyRequired?: boolean;
+}
+
 export function createApp(
   storeOrOpts: EscrowStore | { logger?: Logger; store?: EscrowStore; chainReader?: ChainReader } = new EscrowStore().seed(),
   fallbackChainReader?: ChainReader,
+  options: AppOptions = {},
 ) {
   const resolved = resolveStoreAndLogger(storeOrOpts);
   const store = resolved.store;
@@ -80,6 +107,24 @@ export function createApp(
 
   app.use(helmet({ contentSecurityPolicy: false }));
   app.use(cors());
+
+  // Compression middleware: gzip/br for JSON responses ≥ 1 KB.
+  // Excluded for text/event-stream and when Cache-Control: no-transform is set.
+  app.use(
+    compression({
+      threshold: 1024, // bytes — skip compression for small responses
+      filter(req, res) {
+        // Honour Cache-Control: no-transform (RFC 7234 §5.2.1.6)
+        const cc = res.getHeader('Cache-Control');
+        if (typeof cc === 'string' && cc.includes('no-transform')) return false;
+        // Never compress streaming responses
+        const ct = res.getHeader('Content-Type');
+        if (typeof ct === 'string' && ct.includes('text/event-stream')) return false;
+        return compression.filter(req, res);
+      },
+    }),
+  );
+
   app.use(express.json({ limit: '100kb' }));
 
   // Structured access log on response finish.
@@ -122,15 +167,20 @@ export function createApp(
         'GET  /api/v1/contracts',
         'POST /api/v1/contracts',
         'GET  /api/v1/contracts/:id',
+        'PATCH /api/v1/contracts/:id',
+        'DELETE /api/v1/contracts/:id',
+        'GET  /api/v1/contracts/:id/revisions',
         'POST /api/v1/contracts/:id/deposit',
         'POST /api/v1/contracts/:id/milestones/:index/release',
         'POST /api/v1/contracts/:id/dispute',
         'POST /api/v1/contracts/:id/resolve',
         'POST /api/v1/contracts/:id/cancel',
         'POST /api/v1/contracts/:id/reputation',
+        'POST /api/v1/contracts/:id/reviews',
         'POST /api/v1/contracts/:id/link',
         'GET  /api/v1/contracts/:id/parity',
         'GET  /api/v1/reputation/:address',
+        'GET  /api/v1/reputation/:address/reviews',
       ],
     })),
   );
@@ -155,6 +205,11 @@ export function createApp(
   });
 
   const v1 = express.Router();
+  v1.use(
+    idempotency(options.idempotencyStore ?? new MemoryIdempotencyStore(), {
+      required: options.idempotencyRequired ?? process.env.IDEMPOTENCY_REQUIRED === 'true',
+    }),
+  );
   v1.get(
     '/chain',
     wrap(() => ({
@@ -171,13 +226,13 @@ export function createApp(
       let linked: boolean | undefined = undefined;
       if (req.query.linked === 'true') linked = true;
       else if (req.query.linked === 'false') linked = false;
-      return {
-        data: store.list({
-          status: typeof req.query.status === 'string' ? req.query.status : undefined,
-          party: typeof req.query.party === 'string' ? req.query.party : undefined,
-          linked,
-        }),
-      };
+      const spec = parseFields(req);
+      const contracts = store.list({
+        status: typeof req.query.status === 'string' ? req.query.status : undefined,
+        party: typeof req.query.party === 'string' ? req.query.party : undefined,
+        linked,
+      });
+      return { data: contracts.map((c) => project(c, spec)) };
     }),
   );
   v1.post(
@@ -186,7 +241,19 @@ export function createApp(
       res.status(201).json(store.create(req.body ?? {}));
     }),
   );
-  v1.get('/contracts/:id', wrap((req) => store.get(id(req))));
+  v1.get(
+    '/contracts/:id',
+    wrap((req) => project(store.get(id(req)), parseFields(req))),
+  );
+  v1.patch('/contracts/:id', wrap((req) => store.edit(id(req), req.body ?? {})));
+  v1.delete(
+    '/contracts/:id',
+    wrap((req, res) => {
+      store.delete(id(req), req.body?.client);
+      res.status(204).end();
+    }),
+  );
+  v1.get('/contracts/:id/revisions', wrap((req) => store.getRevisions(id(req))));
   v1.post('/contracts/:id/deposit', wrap((req) => store.deposit(id(req), req.body?.amount)));
   v1.post(
     '/contracts/:id/milestones/:index/release',
@@ -200,6 +267,12 @@ export function createApp(
   v1.post('/contracts/:id/cancel', wrap((req) => store.cancel(id(req))));
   v1.post('/contracts/:id/reputation', wrap((req) => store.rate(id(req), req.body?.rating)));
   v1.post(
+    '/contracts/:id/reviews',
+    wrap((req, res) => {
+      res.status(201).json(store.createReview(id(req), req.body ?? {}));
+    }),
+  );
+  v1.post(
     '/contracts/:id/link',
     wrap(async (req) => store.linkEscrow(id(req), req.body?.escrowId, chainReader)),
   );
@@ -207,7 +280,21 @@ export function createApp(
     '/contracts/:id/parity',
     wrap(async (req) => store.checkParity(id(req), chainReader)),
   );
-  v1.get('/reputation/:address', wrap((req) => store.getReputation(req.params.address)));
+  v1.get('/reputation/:address', wrap((req) => store.getReputationWithClient(req.params.address)));
+  v1.get(
+    '/reputation/:address/reviews',
+    wrap((req) => {
+      const limitRaw = req.query.limit;
+      const limit = typeof limitRaw === 'string' ? Number(limitRaw) : undefined;
+      const cursorRaw = req.query.cursor;
+      const cursor = typeof cursorRaw === 'string' ? Number(cursorRaw) : undefined;
+      return store.listReviews(req.params.address, {
+        role: optionalString(req.query.role),
+        limit: Number.isFinite(limit as number) ? (limit as number) : undefined,
+        cursor: Number.isFinite(cursor as number) ? cursor : undefined,
+      });
+    }),
+  );
   app.use('/api/v1', v1);
 
   app.use((req, res) => {
