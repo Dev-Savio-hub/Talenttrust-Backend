@@ -51,15 +51,88 @@ export const CreateContractBody = z
     client: z.string().min(1),
     freelancer: z.string().min(1),
     token: z.string().max(64).optional(),
-    milestones: z.array(MilestoneItem).min(1).max(20),
+    milestones: z.array(MilestoneItem).min(1).max(20).optional(),
     // Validated (range-checked against the store clock) by EscrowStore.create.
     fundingDeadline: z.string().optional(),
+    /** Create from a saved milestone template instead of explicit milestones. */
+    templateId: z.number().int().positive().optional(),
+    /** Total budget (base units) for percent-mode templates. */
+    budget: Amount.optional(),
   })
   .strict()
   .refine((data) => data.client !== data.freelancer, {
     message: 'client and freelancer must differ',
     path: ['freelancer'],
+  })
+  .refine((data) => !(data.templateId !== undefined && data.milestones !== undefined), {
+    message: 'Cannot provide both templateId and milestones',
+    path: ['milestones'],
+  })
+  .refine((data) => data.templateId !== undefined || data.milestones !== undefined, {
+    message: 'Either templateId or milestones must be provided',
+    path: ['milestones'],
+  })
+  .refine((data) => !(data.milestones !== undefined && data.budget !== undefined), {
+    message: 'budget must not be provided when using milestones directly',
+    path: ['budget'],
   });
+
+// --- Milestone templates ---
+
+export const TemplateModeEnum = z.enum(['fixed', 'percent']);
+
+export const TemplateIdParam = z.object({
+  id: z.string().regex(/^[1-9][0-9]{0,15}$/, 'id must be a positive integer'),
+});
+
+export const TemplateMilestoneItem = z.union([
+  z.object({ title: z.string().max(120).optional(), amount: Amount }).strict(),
+  z.object({ title: z.string().max(120).optional(), percentBps: z.number().int().positive().max(10000) }).strict(),
+]);
+
+type TemplateMilestoneInput = z.infer<typeof TemplateMilestoneItem>;
+const sumBps = (ms: TemplateMilestoneInput[]) => ms.reduce((sum, m) => sum + ('percentBps' in m ? m.percentBps : 0), 0);
+const matchesMode = (mode: 'fixed' | 'percent', ms: TemplateMilestoneInput[]) =>
+  ms.every((m) => (mode === 'fixed' ? 'amount' in m : 'percentBps' in m));
+
+export const CreateTemplateBody = z
+  .object({
+    owner: z.string().min(1),
+    name: z.string().min(1).max(80).trim(),
+    description: z.string().max(500).optional(),
+    mode: TemplateModeEnum,
+    milestones: z.array(TemplateMilestoneItem).min(1).max(20),
+  })
+  .strict()
+  .refine((d) => matchesMode(d.mode, d.milestones), {
+    message: 'milestones must match mode (amount for fixed, percentBps for percent)',
+    path: ['milestones'],
+  })
+  .refine((d) => d.mode !== 'percent' || sumBps(d.milestones) === 10000, {
+    message: 'percentBps must sum to exactly 10000',
+    path: ['milestones'],
+  });
+
+export const UpdateTemplateBody = z
+  .object({
+    owner: z.string().min(1),
+    name: z.string().min(1).max(80).trim().optional(),
+    description: z.string().max(500).optional(),
+    mode: TemplateModeEnum.optional(),
+    milestones: z.array(TemplateMilestoneItem).min(1).max(20).optional(),
+  })
+  .strict()
+  .refine(
+    (d) =>
+      !d.milestones ||
+      (d.mode ? matchesMode(d.mode, d.milestones) : matchesMode('fixed', d.milestones) || matchesMode('percent', d.milestones)),
+    { message: 'milestones must not mix amount and percentBps, and must match mode', path: ['milestones'] },
+  );
+
+export const TemplateOwnerQuery = z.object({ owner: z.string().min(1) }).strict();
+
+export const DeleteTemplateBody = z.object({ owner: z.string().min(1) }).strict();
+
 
 export const DepositBody = z
   .object({

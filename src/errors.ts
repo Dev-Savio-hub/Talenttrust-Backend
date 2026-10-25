@@ -97,6 +97,7 @@ export const ERRORS = {
   invalid_sort: { status: 400, title: 'Invalid sort', detail: "sort must be one of 'oldest', 'newest', 'value'" },
   invalid_overdue: { status: 400, title: 'Invalid overdue filter', detail: "overdue must be 'true' or 'false'" },
   invalid_limit: { status: 400, title: 'Invalid limit', detail: 'limit must be an integer between 1 and 100' },
+  invalid_min_completed: { status: 400, title: 'Invalid minCompleted', detail: 'minCompleted must be a non-negative integer' },
   // On-chain pause
   contract_paused: {
     status: 503,

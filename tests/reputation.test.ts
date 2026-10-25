@@ -70,7 +70,8 @@ describe('Reputation leaderboard, Bayesian ranking, and rating histogram', () =>
     const last = addCompletedRatedJob(store, 'GCLIENT', 'GFREELANCER_H', 1);
 
     const res = await request(app).get('/api/v1/reputation/GFREELANCER_H').expect(200);
-    expect(res.body).toEqual({
+    // GET /reputation/:address also carries asClient
+    expect(res.body).toMatchObject({
       address: 'GFREELANCER_H',
       completedContracts: 5,
       totalRating: 17,
@@ -90,7 +91,7 @@ describe('Reputation leaderboard, Bayesian ranking, and rating histogram', () =>
 
     // With no ratings globally, m = 3 -> score = (C * 3 + 0) / (C + 0) = 3
     const emptyUnrated = await request(emptyApp).get('/api/v1/reputation/GUNRATED').expect(200);
-    expect(emptyUnrated.body).toEqual({
+    expect(emptyUnrated.body).toMatchObject({
       address: 'GUNRATED',
       completedContracts: 0,
       totalRating: 0,
@@ -107,7 +108,7 @@ describe('Reputation leaderboard, Bayesian ranking, and rating histogram', () =>
     const unrated = await request(app)
       .get('/api/v1/reputation/GFREELANCERDEMOAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA')
       .expect(200);
-    expect(unrated.body).toEqual({
+    expect(unrated.body).toMatchObject({
       address: 'GFREELANCERDEMOAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
       completedContracts: 0,
       totalRating: 0,
