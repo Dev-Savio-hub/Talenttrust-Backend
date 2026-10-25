@@ -24,8 +24,13 @@ export const ALLOWED_FIELDS: readonly string[] = [
   'dispute',
   'chain',
   'revision',
+  'version',
   'createdAt',
   'updatedAt',
+  'fundingDeadline',
+  'expiredAt',
+  'refundableAmount',
+  'refundableAmountUnits',
 ] as const;
 
 /** Keys permitted inside a `milestones.<sub>` selector. */
