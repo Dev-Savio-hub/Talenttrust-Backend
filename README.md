@@ -28,7 +28,7 @@ When the escrow contract is paused on-chain (`is_paused`, cached for `PAUSE_CHEC
 | GET | `/health` | Health check (includes `paused` and `pauseSource`) |
 | GET | `/docs` | Swagger UI |
 | GET | `/openapi.json` | OpenAPI 3 spec |
-| GET | `/api/v1/chain` | On-chain contract deployment info (includes `paused` and `pauseSource`) |
+| GET | `/api/v1/chain` | Deployment info, pause state (`paused`, `pauseSource`) and live on-chain status (`onChain`: `version`, `paused`, `contractCount`, `admin`, `latestLedger`); `?refresh=true` bypasses the 15s cache (rate-limited to once per 5s) |
 | GET | `/api/v1/stats` | Aggregate statistics |
 | GET | `/api/v1/auth/challenge` | Request a sign challenge (`?address=G…`) |
 | POST | `/api/v1/auth/token` | Exchange a signed challenge for a bearer token |
@@ -48,6 +48,7 @@ When the escrow contract is paused on-chain (`is_paused`, cached for `PAUSE_CHEC
 | POST | `/api/v1/contracts/:id/reviews` | Two-sided review: `{ "reviewer": "G...", "rating": 5, "comment": "..." }` |
 | POST | `/api/v1/contracts/:id/link` | Link to on-chain escrow `{ "escrowId": "3" }` |
 | GET | `/api/v1/contracts/:id/parity` | Parity check report against on-chain state |
+| GET | `/api/v1/reputation` | Ranked freelancer leaderboard (`?sort=score\|completed\|average&minCompleted=&limit=&cursor=`) |
 | GET | `/api/v1/reputation/:address` | Reputation (freelancer fields + `asClient`) |
 | GET | `/api/v1/reputation/:address/reviews` | Reviews received (`?role=`, `?limit=`, `?cursor=`) |
 | GET | `/.well-known/talenttrust-receipts.json` | Published ed25519 public keys for offline verification |
@@ -56,11 +57,21 @@ When the escrow contract is paused on-chain (`is_paused`, cached for `PAUSE_CHEC
 | GET/POST | `/api/cron/expire-contracts` | Authenticated daily sweep of due unfunded contracts |
 | GET | `/api/v1/disputes` | Admin dispute queue (`?status=`, `?sort=`, `?overdue=`, `?limit=`, `?cursor=`), requires `Authorization: Bearer $ADMIN_READ_TOKEN` |
 | GET | `/api/v1/disputes/:contractId` | Dispute view for one contract (404 if it never had a dispute), same auth |
+| POST/GET | `/api/v1/templates` | Create a milestone template (`fixed` amounts or `percent` bps summing to 10000) / list by `?owner=` |
+| GET/PUT/DELETE | `/api/v1/templates/:id` | Get / update (owner only, bumps `version`) / delete (owner only) a template |
 | GET | `/api/v1/contracts/:id/history` | Hash-chained audit history of a contract (`?limit=`, `?cursor=`) |
 | GET | `/api/v1/audit/verify` | Verify audit chain integrity (`{ valid, entries, brokenAt? }`) |
 | GET | `/metrics` | Prometheus exposition-format metrics (requires `Authorization: Bearer <METRICS_TOKEN>`; disabled when `METRICS_TOKEN` unset) |
 
 *Note: All contract mutation endpoints accept `?receipt=true` to attach a signed `Receipt` JWS header.*
+
+## Milestone templates
+
+`POST /api/v1/contracts` accepts `{ templateId, budget?, client, freelancer, token?, title? }` instead of
+`milestones`. Fixed templates copy their amounts (`budget` not allowed); percent templates require `budget` and
+give each milestone `floor(budget * percentBps / 10000)`, adding the remainder to the last milestone. Supplying both
+`templateId` and `milestones` is a 400. Contracts record `templateId` and `templateVersion`; editing or deleting a
+template never changes contracts already created from it.
 
 ## Audit log
 
@@ -172,7 +183,8 @@ Configuration (all optional, see `.env.example`): `PORT`, `LOG_LEVEL` (debug|inf
 `METRICS_TOKEN` (protects `GET /metrics`; when unset the endpoint is disabled),
 `CURSOR_SECRET` (signs contract-list cursors; random per-process default), `REQUIRE_IF_MATCH` (`true` makes `If-Match` mandatory on contract mutations),
 `ESCROW_CONTRACT_ID`, `STELLAR_NETWORK`, `STELLAR_RPC_URL`, `STELLAR_NETWORK_PASSPHRASE`, `TX_TIMEOUT_SECONDS`, `FRONTEND_URL`, `IDEMPOTENCY_REQUIRED`, `AUTH_SECRET`, `AUTH_REQUIRED`,
-`BODY_LIMIT` (maximum request body size, default `100kb`),
+`BODY_LIMIT` (maximum request body size, default `100kb`), `REPUTATION_PRIOR_WEIGHT` (Bayesian prior weight C, default 5), `RPC_TIMEOUT_MS` (default 4000), `CHAIN_STATUS_TTL_MS`
+(default 15000), `CHAIN_REFRESH_MIN_INTERVAL_MS` (default 5000),
 `RECEIPT_SIGNING_SECRET` (Stellar `S...` ed25519 seed), and `CRON_SECRET` (required to authenticate
 `GET`/`POST /api/cron/expire-contracts`). New contracts default to a funding deadline 14 days after
 creation; explicit deadlines must be between one hour and 90 days in the future. Contracts still unfunded

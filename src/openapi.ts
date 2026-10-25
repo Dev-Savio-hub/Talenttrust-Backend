@@ -161,10 +161,56 @@ const spec = {
     { name: 'Transaction' },
     { name: 'Receipts' },
     { name: 'Cron' },
+    { name: 'Templates', description: 'Reusable milestone plans for creating contracts' },
     { name: 'Audit', description: 'Tamper-evident, hash-chained log of escrow state transitions' },
     { name: 'Disputes', description: 'Admin dispute queue. Requires the ADMIN_READ_TOKEN bearer token.' },
   ],
   paths: {
+    '/api/v1/templates': {
+      post: {
+        tags: ['Templates'],
+        summary: 'Create a milestone template (fixed amounts or percent of a budget)',
+        requestBody: { required: true, content: json({ $ref: '#/components/schemas/TemplateInput' }) },
+        responses: { 201: { description: 'Created', content: json({ $ref: '#/components/schemas/Template' }) }, 400: errorResponse('Invalid template') },
+      },
+      get: {
+        tags: ['Templates'],
+        summary: 'List templates of an owner',
+        parameters: [{ name: 'owner', in: 'query', required: true, schema: { type: 'string' } }],
+        responses: { ...ok('Templates', { type: 'object', properties: { data: { type: 'array', items: { $ref: '#/components/schemas/Template' } } } }), 400: errorResponse('owner is required') },
+      },
+    },
+    '/api/v1/templates/{id}': {
+      get: {
+        tags: ['Templates'],
+        summary: 'Get a template',
+        parameters: [idParam],
+        responses: { ...ok('Template', { $ref: '#/components/schemas/Template' }), 404: errorResponse('Template not found') },
+      },
+      put: {
+        tags: ['Templates'],
+        summary: 'Update a template (owner only; bumps version)',
+        parameters: [idParam],
+        requestBody: { required: true, content: json({ $ref: '#/components/schemas/TemplateInput' }) },
+        responses: {
+          ...ok('Updated template', { $ref: '#/components/schemas/Template' }),
+          400: errorResponse('Invalid template'),
+          403: errorResponse('Not the owner'),
+          404: errorResponse('Template not found'),
+        },
+      },
+      delete: {
+        tags: ['Templates'],
+        summary: 'Delete a template (owner only; existing contracts are unaffected)',
+        parameters: [idParam],
+        requestBody: { required: true, content: json({ type: 'object', required: ['owner'], properties: { owner: { type: 'string' } } }) },
+        responses: {
+          ...ok('Deleted', { type: 'object', properties: { success: { type: 'boolean' } } }),
+          403: errorResponse('Not the owner'),
+          404: errorResponse('Template not found'),
+        },
+      },
+    },
     '/api/v1/contracts/{id}/history': {
       get: {
         tags: ['Audit'],
@@ -362,7 +408,38 @@ const spec = {
         },
       },
     },
-    '/health': { get: { tags: ['System'], summary: 'Health check', responses: ok('Service is healthy') } },
+    '/': {
+      get: {
+        tags: ['System'],
+        summary: 'Service index',
+        description: 'Service name, documentation links and the list of available endpoints.',
+        responses: ok('Service index', { $ref: '#/components/schemas/ServiceInfo' }),
+      },
+    },
+    '/docs': {
+      get: {
+        tags: ['System'],
+        summary: 'Swagger UI for this spec',
+        responses: { 200: { description: 'HTML page', content: { 'text/html': { schema: { type: 'string' } } } } },
+      },
+    },
+    '/openapi.json': {
+      get: { tags: ['System'], summary: 'This OpenAPI document', responses: ok('OpenAPI 3.0.3 document', { type: 'object' }) },
+    },
+    '/health': {
+      get: {
+        tags: ['System'],
+        summary: 'Health check',
+        responses: {
+          ...ok('Service is healthy', { $ref: '#/components/schemas/Health' }),
+          503: {
+            description: 'Draining during graceful shutdown (`Connection: close`)',
+            'x-plain-json': true,
+            content: json({ type: 'object', required: ['status'], properties: { status: { type: 'string', enum: ['draining'] } } }),
+          },
+        },
+      },
+    },
     '/.well-known/talenttrust-receipts.json': {
       get: {
         tags: ['Receipts'],
@@ -373,8 +450,23 @@ const spec = {
     '/api/v1/chain': {
       get: {
         tags: ['System'],
-        summary: 'On-chain escrow contract deployment info',
-        responses: ok('Deployment', {
+        summary: 'On-chain escrow contract deployment info with live contract status',
+        description:
+          'Static deployment info, the pause guard state, and `onChain`, a cached snapshot read from the Soroban RPC ' +
+          '(contract version, paused flag, escrow count, admin, latest ledger). The endpoint always returns 200; when ' +
+          'the RPC is unreachable, `onChain.reachable` is false and `onChain.error` explains why. If a previous snapshot ' +
+          'exists it is served with `onChain.stale` true. Results are cached for CHAIN_STATUS_TTL_MS (15s); ' +
+          '`refresh=true` bypasses the cache at most once per CHAIN_REFRESH_MIN_INTERVAL_MS (5s).',
+        parameters: [
+          {
+            name: 'refresh',
+            in: 'query',
+            required: false,
+            schema: { type: 'string', enum: ['true'] },
+            description: 'Bypass the cache and re-read the contract (rate-limited).',
+          },
+        ],
+        responses: ok('Deployment and live on-chain status', {
           type: 'object',
           properties: {
             network: { type: 'string' },
@@ -383,6 +475,7 @@ const spec = {
             explorer: { type: 'string' },
             paused: { type: 'boolean' },
             pauseSource: { type: 'string', enum: ['chain', 'env', 'none'] },
+            onChain: { $ref: '#/components/schemas/OnChainStatus' },
           },
         }),
       },
@@ -472,7 +565,7 @@ const spec = {
           required: true,
           content: json({
             type: 'object',
-            required: ['client', 'freelancer', 'milestones'],
+            required: ['client', 'freelancer'],
             properties: {
               title: { type: 'string' },
               client: { type: 'string' },
@@ -482,6 +575,14 @@ const spec = {
                 type: 'string',
                 format: 'date-time',
                 description: 'ISO-8601 deadline, from 1 hour through 90 days after creation (default 14 days)',
+              },
+              templateId: {
+                type: 'integer',
+                description: 'Create from a milestone template instead of `milestones` (exactly one of the two is required)',
+              },
+              budget: {
+                ...amountSchema,
+                description: 'Total budget in base units; required for percent templates, forbidden otherwise',
               },
               milestones: milestonesSchema,
             },
@@ -718,6 +819,34 @@ const spec = {
         },
       },
     },
+    '/api/v1/reputation': {
+      get: {
+        tags: ['Reputation'],
+        summary: 'Ranked freelancer leaderboard (Bayesian score)',
+        description:
+          'score = round2((C * m + totalRating) / (C + completedContracts)) with m the global mean rating (3 when there ' +
+          'are none) and C = REPUTATION_PRIOR_WEIGHT (default 5). Ties break by completedContracts desc, then address.',
+        parameters: [
+          { name: 'sort', in: 'query', schema: { type: 'string', enum: ['score', 'completed', 'average'], default: 'score' } },
+          { name: 'minCompleted', in: 'query', schema: { type: 'integer', minimum: 0, default: 1 } },
+          { name: 'limit', in: 'query', schema: { type: 'integer', minimum: 1, maximum: 100, default: 20 } },
+          { name: 'cursor', in: 'query', schema: { type: 'string' }, description: 'page.nextCursor from the previous page (same sort)' },
+        ],
+        responses: {
+          ...ok('Leaderboard page', {
+            type: 'object',
+            properties: {
+              data: { type: 'array', items: { $ref: '#/components/schemas/Reputation' } },
+              page: {
+                type: 'object',
+                properties: { limit: { type: 'integer' }, nextCursor: { type: 'string', nullable: true }, hasMore: { type: 'boolean' } },
+              },
+            },
+          }),
+          400: errorResponse('invalid_sort, invalid_min_completed, invalid_limit or invalid_cursor'),
+        },
+      },
+    },
     '/api/v1/reputation/{address}': {
       get: {
         tags: ['Reputation'],
@@ -792,6 +921,10 @@ const spec = {
       },
     },
     responses: {
+      NotFound: {
+        description: 'No route matches the method and path (`not_found`, with `docs`)',
+        content: json({ $ref: '#/components/schemas/Error' }),
+      },
       InvalidIdempotencyKey: {
         description: 'Idempotency-Key is malformed (`invalid_idempotency_key`) or missing while required (`idempotency_key_required`)',
         content: json({ $ref: '#/components/schemas/Error' }),
@@ -809,6 +942,68 @@ const spec = {
       },
     },
     schemas: {
+      OnChainStatus: {
+        type: 'object',
+        description: 'Live escrow contract state read from the Soroban RPC (cached, degrades gracefully).',
+        required: ['reachable', 'fetchedAt', 'stale'],
+        properties: {
+          reachable: { type: 'boolean', description: 'False when the RPC could not be reached and no cached snapshot exists.' },
+          latestLedger: { type: 'integer', description: 'Latest ledger seen at fetch time.' },
+          version: { type: 'string', description: 'Contract version() return value.' },
+          paused: { type: 'boolean', description: 'Contract is_paused() return value.' },
+          contractCount: { type: 'integer', description: 'Contract contract_count() return value.' },
+          admin: { type: 'string', description: 'Contract get_admin() return value.' },
+          fetchedAt: { type: 'string', format: 'date-time' },
+          stale: { type: 'boolean', description: 'True when serving the last good snapshot after an RPC failure.' },
+          error: { type: 'string', description: 'Sanitised error summary when the last RPC read failed.' },
+        },
+      },
+      Template: {
+        type: 'object',
+        properties: {
+          id: { type: 'integer' },
+          owner: { type: 'string' },
+          name: { type: 'string', maxLength: 80 },
+          description: { type: 'string', maxLength: 500 },
+          mode: { type: 'string', enum: ['fixed', 'percent'] },
+          milestones: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                title: { type: 'string' },
+                amount: { type: 'number', description: 'fixed mode (DEPRECATED — lossy above 2^53; use amountUnits)' },
+                amountUnits: { type: 'string', description: 'fixed mode amount in base units' },
+                percentBps: { type: 'integer', description: 'percent mode share; all shares sum to 10000' },
+              },
+            },
+          },
+          version: { type: 'integer' },
+          createdAt: { type: 'string', format: 'date-time' },
+          updatedAt: { type: 'string', format: 'date-time' },
+        },
+      },
+      TemplateInput: {
+        type: 'object',
+        required: ['owner'],
+        properties: {
+          owner: { type: 'string' },
+          name: { type: 'string', maxLength: 80 },
+          description: { type: 'string', maxLength: 500 },
+          mode: { type: 'string', enum: ['fixed', 'percent'] },
+          milestones: {
+            type: 'array',
+            minItems: 1,
+            maxItems: 20,
+            items: {
+              oneOf: [
+                { type: 'object', required: ['amount'], properties: { title: { type: 'string' }, amount: amountSchema } },
+                { type: 'object', required: ['percentBps'], properties: { title: { type: 'string' }, percentBps: { type: 'integer', minimum: 1, maximum: 10000 } } },
+              ],
+            },
+          },
+        },
+      },
       AuditEntry: {
         type: 'object',
         description:
@@ -988,6 +1183,10 @@ const spec = {
           completedContracts: { type: 'integer' },
           totalRating: { type: 'integer' },
           averageRating: { type: 'number' },
+          score: { type: 'number', description: 'Bayesian score (see GET /api/v1/reputation)' },
+          rank: { type: 'integer', nullable: true, description: '1-based rank by score; null when unrated' },
+          histogram: { type: 'array', items: { type: 'integer' }, minItems: 5, maxItems: 5, description: 'Counts of 1★..5★ ratings' },
+          lastRatedAt: { type: 'string', format: 'date-time', nullable: true },
           asClient: {
             type: 'object',
             properties: {
@@ -1045,35 +1244,112 @@ const spec = {
       },
       Error: {
         type: 'object',
-        properties: { error: { type: 'string' }, message: { type: 'string' } },
+        description:
+          'Error envelope shared by every 4xx/5xx response (served as application/problem+json, see Problem). ' +
+          'Route-specific fields (details, contractError, currentVersion, docs, …) may be added.',
+        required: ['error', 'message'],
+        properties: {
+          error: { type: 'string', description: 'Machine-readable code (see GET /api/v1/errors)' },
+          message: { type: 'string' },
+          requestId: { type: 'string' },
+          docs: { type: 'string', description: 'Present on the global route-not-found 404' },
+          type: { type: 'string' },
+          title: { type: 'string' },
+          status: { type: 'integer' },
+          detail: { type: 'string' },
+        },
+      },
+      Milestone: {
+        type: 'object',
+        required: ['index', 'title', 'amount', 'amountUnits', 'released'],
+        additionalProperties: false,
+        properties: {
+          index: { type: 'integer', minimum: 0 },
+          title: { type: 'string' },
+          amount: {
+            description: 'DEPRECATED — lossy above 2^53. Use amountUnits.',
+            oneOf: [{ type: 'number' }, { type: 'string' }],
+          },
+          amountUnits: {
+            type: 'string',
+            description: 'Canonical decimal string amount in token base units (e.g. stroops).',
+          },
+          released: { type: 'boolean' },
+        },
+      },
+      Dispute: {
+        type: 'object',
+        required: ['raisedBy', 'openedAt'],
+        additionalProperties: false,
+        properties: {
+          raisedBy: { type: 'string' },
+          reason: { type: 'string', description: 'Confidential: only returned by the admin dispute routes' },
+          openedAt: { type: 'string', format: 'date-time' },
+          freelancerBps: { type: 'integer', minimum: 0, maximum: 10000 },
+          resolvedAt: { type: 'string', format: 'date-time' },
+        },
+      },
+      ServiceInfo: {
+        type: 'object',
+        required: ['name', 'version', 'description', 'docs', 'openapi', 'endpoints'],
+        properties: {
+          name: { type: 'string' },
+          version: { type: 'string' },
+          description: { type: 'string' },
+          docs: { type: 'string' },
+          openapi: { type: 'string' },
+          website: { type: 'string' },
+          chain: {
+            type: 'object',
+            properties: { network: { type: 'string' }, contractId: { type: 'string' }, explorer: { type: 'string' } },
+          },
+          endpoints: { type: 'array', items: { type: 'string' } },
+        },
+      },
+      Health: {
+        type: 'object',
+        required: ['status', 'version', 'uptimeSeconds', 'storage', 'timestamp'],
+        properties: {
+          status: { type: 'string', enum: ['ok'] },
+          version: { type: 'string' },
+          uptimeSeconds: { type: 'integer', minimum: 0 },
+          storage: { type: 'string' },
+          paused: { type: 'boolean' },
+          pauseSource: { type: 'string', enum: ['chain', 'env', 'none'] },
+          timestamp: { type: 'string', format: 'date-time' },
+        },
       },
       EscrowContract: {
         type: 'object',
+        additionalProperties: false,
+        required: [
+          'id',
+          'title',
+          'client',
+          'freelancer',
+          'token',
+          'milestones',
+          'totalAmount',
+          'totalAmountUnits',
+          'fundedAmount',
+          'fundedAmountUnits',
+          'releasedAmount',
+          'releasedAmountUnits',
+          'status',
+          'reputationIssued',
+          'revision',
+          'version',
+          'fundingDeadline',
+          'createdAt',
+          'updatedAt',
+        ],
         properties: {
           id: { type: 'integer' },
           title: { type: 'string' },
           client: { type: 'string' },
           freelancer: { type: 'string' },
           token: { type: 'string' },
-          milestones: {
-            type: 'array',
-            items: {
-              type: 'object',
-              properties: {
-                index: { type: 'integer' },
-                title: { type: 'string' },
-                amount: {
-                  description: 'DEPRECATED — lossy above 2^53. Use amountUnits.',
-                  oneOf: [{ type: 'number' }, { type: 'string' }],
-                },
-                amountUnits: {
-                  type: 'string',
-                  description: 'Canonical decimal string amount in token base units (e.g. stroops).',
-                },
-                released: { type: 'boolean' },
-              },
-            },
-          },
+          milestones: { type: 'array', items: { $ref: '#/components/schemas/Milestone' } },
           totalAmount: {
             description: 'DEPRECATED — lossy above 2^53. Use totalAmountUnits.',
             oneOf: [{ type: 'number' }, { type: 'string' }],
@@ -1104,19 +1380,11 @@ const spec = {
           expiredAt: { type: 'string', format: 'date-time' },
           refundableAmount: { type: 'number', description: 'DEPRECATED — lossy above 2^53. Use refundableAmountUnits.' },
           refundableAmountUnits: { type: 'string', description: 'Partial funding returned to the client on expiry (base units).' },
-          dispute: {
-            type: 'object',
-            nullable: true,
-            properties: {
-              raisedBy: { type: 'string' },
-              reason: { type: 'string' },
-              openedAt: { type: 'string', format: 'date-time' },
-              freelancerBps: { type: 'integer' },
-              resolvedAt: { type: 'string', format: 'date-time' },
-            },
-          },
+          dispute: { $ref: '#/components/schemas/Dispute' },
           chain: { $ref: '#/components/schemas/ChainInfo' },
           revision: { type: 'integer', minimum: 1, description: 'Term revision; increments on every edit.' },
+          templateId: { type: 'integer', description: 'Template the milestones were generated from' },
+          templateVersion: { type: 'integer', description: 'Template version used at creation' },
           version: { type: 'integer', minimum: 1, description: 'Entity version behind the ETag; increments on every state change.' },
           createdAt: { type: 'string', format: 'date-time' },
           updatedAt: { type: 'string', format: 'date-time' },
@@ -1510,12 +1778,18 @@ const problemContent = { 'application/problem+json': { schema: { $ref: '#/compon
  */
 function withProblems<T extends { paths: object; components: object }>(doc: T): T {
   const toProblem = (r: { $ref?: string; content?: Record<string, { schema?: object }> }) => {
-    if (r.$ref) return;
+    if (r.$ref || (r as { 'x-plain-json'?: boolean })['x-plain-json']) return;
     const schema = r.content?.['application/json']?.schema as { $ref?: string } | undefined;
-    // Keep a more specific error schema (e.g. ChainMismatchError) next to the Problem fields.
-    r.content = schema?.$ref && !/ErrorResponse$/.test(schema.$ref)
-      ? { 'application/problem+json': { schema: { allOf: [{ $ref: '#/components/schemas/Problem' }, schema] } } }
-      : problemContent;
+    // Every error documents the shared Error envelope (application/json) and the RFC 9457 view of the
+    // same body (application/problem+json, what the server sends). A more specific error schema
+    // (e.g. ChainMismatchError) is kept next to the Problem fields.
+    const specific = schema?.$ref && !/(ErrorResponse|Error)$/.test(schema.$ref) ? schema : undefined;
+    r.content = {
+      'application/json': { schema: { $ref: '#/components/schemas/Error' } },
+      'application/problem+json': {
+        schema: specific ? { allOf: [{ $ref: '#/components/schemas/Problem' }, specific] } : { $ref: '#/components/schemas/Problem' },
+      },
+    };
   };
   const paths = doc.paths as Record<string, Record<string, Operation>>;
   for (const item of Object.values(paths)) {
@@ -1523,7 +1797,11 @@ function withProblems<T extends { paths: object; components: object }>(doc: T): 
       for (const [code, r] of Object.entries(op.responses)) {
         if (/^[45]/.test(code)) toProblem(r as Parameters<typeof toProblem>[0]);
       }
-      if (!op.responses['500']) op.responses = { ...op.responses, 500: { description: 'Unexpected error (internal_error)', content: problemContent } };
+      if (!op.responses['500']) {
+        const internal = { description: 'Unexpected error (internal_error)', content: { ...problemContent } };
+        toProblem(internal);
+        op.responses = { ...op.responses, 500: internal };
+      }
     }
   }
   const responses = (doc.components as { responses?: Record<string, Parameters<typeof toProblem>[0]> }).responses ?? {};

@@ -25,6 +25,8 @@ export const ALLOWED_FIELDS: readonly string[] = [
   'chain',
   'revision',
   'version',
+  'templateId',
+  'templateVersion',
   'createdAt',
   'updatedAt',
   'fundingDeadline',

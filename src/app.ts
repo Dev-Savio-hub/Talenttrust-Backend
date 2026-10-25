@@ -18,6 +18,7 @@ import {
 } from './store';
 import { openapi, docsHtml } from './openapi';
 import { PauseGuard } from './pauseGuard';
+import { type ChainReader as ChainStatusReader, createStellarChainReader } from './stellar/chain-status';
 import { ERRORS, PROBLEM_TYPE_BASE, isErrorKey } from './errors';
 import { validate } from './validation/middleware';
 import {
@@ -32,6 +33,11 @@ import {
   CancelBody,
   ListQuery,
   ReputationAddressParam,
+  TemplateIdParam,
+  CreateTemplateBody,
+  UpdateTemplateBody,
+  DeleteTemplateBody,
+  TemplateOwnerQuery,
 } from './validation/schemas';
 import { parseFieldSpec, project } from './utils/project';
 import { createLogger, type Logger, randomUUID } from './logger';
@@ -335,6 +341,8 @@ export type AppDeps = {
   registry?: Registry;
   /** On-chain pause check (operator override + cached Soroban `is_paused`). */
   pauseGuard?: PauseGuard;
+  /** Live contract status for GET /api/v1/chain; defaults to the cached Soroban RPC reader. */
+  chainStatusReader?: ChainStatusReader;
 };
 
 /**
@@ -394,6 +402,8 @@ export function createApp(
   const deps: AppDeps = isDeps ? ((storeOrOpts as AppDeps | undefined) ?? {}) : {};
   const auth = resolveAuth(deps);
   const pauseGuard = deps.pauseGuard ?? new PauseGuard();
+  let chainStatusReader = deps.chainStatusReader;
+  const chainStatus = () => (chainStatusReader ??= createStellarChainReader());
   /** 503 for mutations whose Soroban counterparts call require_not_paused. */
   const requireNotPaused = async (_req: Request, res: Response, next: NextFunction) => {
     try {
@@ -559,8 +569,14 @@ export function createApp(
         'POST /api/v1/contracts/:id/reviews',
         'POST /api/v1/contracts/:id/link',
         'GET  /api/v1/contracts/:id/parity',
+        'GET  /api/v1/reputation',
         'GET  /api/v1/reputation/:address',
         'GET  /api/v1/reputation/:address/reviews',
+        'POST /api/v1/templates',
+        'GET  /api/v1/templates',
+        'GET  /api/v1/templates/:id',
+        'PUT  /api/v1/templates/:id',
+        'DELETE /api/v1/templates/:id',
         'GET  /api/v1/contracts/:id/history',
         'GET  /api/v1/audit/verify',
         'GET  /api/v1/disputes (admin)',
@@ -692,8 +708,11 @@ export function createApp(
 
   v1.get(
     '/chain',
-    wrap(async () => {
-      const pause = await pauseGuard.isPaused();
+    wrap(async (req) => {
+      const [pause, onChain] = await Promise.all([
+        pauseGuard.isPaused(),
+        chainStatus().getStatus({ refresh: req.query.refresh === 'true' }),
+      ]);
       return {
         network: config.network,
         rpcUrl: config.rpcUrl,
@@ -701,6 +720,7 @@ export function createApp(
         explorer: explorerUrl(),
         paused: pause.paused,
         pauseSource: pause.source,
+        onChain,
       };
     }),
   );
@@ -920,6 +940,17 @@ export function createApp(
     }),
   );
   v1.get(
+    '/reputation',
+    wrap((req) =>
+      store.listReputation({
+        sort: req.query.sort,
+        minCompleted: req.query.minCompleted,
+        limit: req.query.limit,
+        cursor: req.query.cursor,
+      }),
+    ),
+  );
+  v1.get(
     '/reputation/:address',
     validate({ params: ReputationAddressParam }),
     wrap((req) => store.getReputationWithClient(req.params.address)),
@@ -985,6 +1016,46 @@ export function createApp(
         }
       }
       return { valid: true, kid: verified.kid, iat: verified.iat, contractId: verified.contractId, matchesCurrent };
+    }),
+  );
+
+  // --- Milestone templates ---
+  // With wallet auth the authenticated address is the owner.
+  const ownerOf = (req: Request): unknown => {
+    const caller = callerOf(req);
+    if (caller === undefined) return req.body?.owner;
+    if (req.body?.owner !== undefined && req.body.owner !== caller) {
+      throw new HttpError(403, 'forbidden', 'Authenticated address must match template owner');
+    }
+    return caller;
+  };
+  v1.post(
+    '/templates',
+    requireAuth,
+    validate({ body: CreateTemplateBody }),
+    wrap((req, res) => {
+      res.status(201).json(store.createTemplate({ ...req.body, owner: ownerOf(req) }));
+    }),
+  );
+  v1.get(
+    '/templates',
+    validate({ query: TemplateOwnerQuery }),
+    wrap((req) => ({ data: store.listTemplates({ owner: req.query.owner as string }) })),
+  );
+  v1.get('/templates/:id', validate({ params: TemplateIdParam }), wrap((req) => store.getTemplate(Number(req.params.id))));
+  v1.put(
+    '/templates/:id',
+    requireAuth,
+    validate({ params: TemplateIdParam, body: UpdateTemplateBody }),
+    wrap((req) => store.updateTemplate(Number(req.params.id), ownerOf(req), req.body)),
+  );
+  v1.delete(
+    '/templates/:id',
+    requireAuth,
+    validate({ params: TemplateIdParam, body: DeleteTemplateBody }),
+    wrap((req) => {
+      store.deleteTemplate(Number(req.params.id), ownerOf(req));
+      return { success: true };
     }),
   );
 
