@@ -98,6 +98,13 @@ export const ERRORS = {
   invalid_overdue: { status: 400, title: 'Invalid overdue filter', detail: "overdue must be 'true' or 'false'" },
   invalid_limit: { status: 400, title: 'Invalid limit', detail: 'limit must be an integer between 1 and 100' },
   invalid_min_completed: { status: 400, title: 'Invalid minCompleted', detail: 'minCompleted must be a non-negative integer' },
+  // Signed transaction relay
+  invalid_transaction: { status: 400, title: 'Invalid transaction', detail: 'The signed XDR is not a valid escrow contract call for this deployment' },
+  submission_failed: { status: 422, title: 'Submission failed', detail: 'Soroban RPC rejected the transaction' },
+  try_again_later: { status: 503, title: 'Try again later', detail: 'Soroban RPC is busy; retry after Retry-After seconds' },
+  rpc_error: { status: 502, title: 'RPC error', detail: 'Unexpected response from Soroban RPC' },
+  invalid_hash: { status: 400, title: 'Invalid hash', detail: 'Transaction hash must be a 64-character hex string' },
+  too_many_waits: { status: 503, title: 'Too many waits', detail: 'Too many concurrent long-poll requests' },
   // On-chain pause
   contract_paused: {
     status: 503,

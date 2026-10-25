@@ -161,11 +161,142 @@ const spec = {
     { name: 'Transaction' },
     { name: 'Receipts' },
     { name: 'Cron' },
+    { name: 'Transactions', description: 'Relay of wallet-signed escrow transactions to Soroban RPC' },
     { name: 'Templates', description: 'Reusable milestone plans for creating contracts' },
     { name: 'Audit', description: 'Tamper-evident, hash-chained log of escrow state transitions' },
     { name: 'Disputes', description: 'Admin dispute queue. Requires the ADMIN_READ_TOKEN bearer token.' },
   ],
   paths: {
+    '/api/v1/tx/submit': {
+      post: {
+        tags: ['Transactions'],
+        summary: 'Validate and relay a signed Soroban escrow transaction to RPC',
+        requestBody: {
+          required: true,
+          content: json({
+            type: 'object',
+            required: ['xdr'],
+            properties: {
+              xdr: {
+                type: 'string',
+                description: 'Base64-encoded signed TransactionEnvelope XDR targeting the configured escrow contract',
+              },
+            },
+          }),
+        },
+        responses: {
+          200: {
+            description: 'Transaction was already known (DUPLICATE); returns current status',
+            content: json({ $ref: '#/components/schemas/TxStatusResponse' }),
+          },
+          202: {
+            description: 'Transaction accepted and pending inclusion in a ledger',
+            content: json({
+              type: 'object',
+              required: ['hash', 'status'],
+              properties: {
+                hash: { type: 'string', pattern: '^[0-9a-f]{64}$' },
+                status: { type: 'string', enum: ['PENDING'] },
+              },
+            }),
+          },
+          400: {
+            description: 'Invalid transaction XDR or failed escrow contract validation rules',
+            content: json({ $ref: '#/components/schemas/ErrorResponse' }),
+          },
+          422: {
+            description: 'Transaction rejected by Soroban RPC (submission_failed)',
+            content: json({
+              type: 'object',
+              required: ['error', 'message', 'code'],
+              properties: {
+                error: { type: 'string', enum: ['submission_failed'] },
+                message: { type: 'string' },
+                code: { type: 'string', description: 'Decoded TransactionResultCode (e.g. txBadSeq, txInsufficientFee)' },
+                hash: { type: 'string' },
+              },
+            }),
+          },
+          503: {
+            description: 'Soroban RPC returned TRY_AGAIN_LATER',
+            headers: {
+              'Retry-After': {
+                description: 'Seconds to wait before retrying submission',
+                schema: { type: 'integer' },
+              },
+            },
+            content: json({ $ref: '#/components/schemas/ErrorResponse' }),
+          },
+        },
+      },
+    },
+    '/api/v1/tx': {
+      get: {
+        tags: ['Transactions'],
+        summary: 'List recent relayed escrow transactions from the bounded LRU cache',
+        parameters: [
+          {
+            name: 'limit',
+            in: 'query',
+            required: false,
+            description: 'Maximum number of recent transactions to return (default 20)',
+            schema: { type: 'integer', minimum: 1, maximum: config.txCacheMax, default: 20 },
+          },
+        ],
+        responses: {
+          200: {
+            description: 'Recent relayed transactions (most recent first)',
+            content: json({
+              type: 'object',
+              required: ['data'],
+              properties: {
+                data: { type: 'array', items: { $ref: '#/components/schemas/RelayedTransaction' } },
+              },
+            }),
+          },
+          400: {
+            description: 'Invalid limit parameter',
+            content: json({ $ref: '#/components/schemas/ErrorResponse' }),
+          },
+        },
+      },
+    },
+    '/api/v1/tx/{hash}': {
+      get: {
+        tags: ['Transactions'],
+        summary: 'Get transaction status, decoded returnValue, and contract error details',
+        parameters: [
+          {
+            name: 'hash',
+            in: 'path',
+            required: true,
+            description: '64-character hex transaction hash',
+            schema: { type: 'string', pattern: '^[0-9a-fA-F]{64}$' },
+          },
+          {
+            name: 'wait',
+            in: 'query',
+            required: false,
+            description: 'If true, long-polls up to 20s (every 1s) until transaction leaves PENDING/NOT_FOUND',
+            schema: { type: 'boolean', default: false },
+          },
+        ],
+        responses: {
+          200: {
+            description: 'Transaction status and decoded result',
+            content: json({ $ref: '#/components/schemas/TxStatusResponse' }),
+          },
+          400: {
+            description: 'Invalid transaction hash format',
+            content: json({ $ref: '#/components/schemas/ErrorResponse' }),
+          },
+          503: {
+            description: 'Too many concurrent long-poll requests',
+            content: json({ $ref: '#/components/schemas/ErrorResponse' }),
+          },
+        },
+      },
+    },
     '/api/v1/templates': {
       post: {
         tags: ['Templates'],
@@ -942,6 +1073,39 @@ const spec = {
       },
     },
     schemas: {
+      RelayedTransaction: {
+        type: 'object',
+        required: ['hash', 'function', 'submittedAt'],
+        properties: {
+          hash: { type: 'string', pattern: '^[0-9a-f]{64}$' },
+          function: { type: 'string' },
+          submittedAt: { type: 'string', format: 'date-time' },
+        },
+      },
+      ContractError: {
+        type: 'object',
+        required: ['name', 'code'],
+        properties: {
+          name: { type: 'string', description: 'EscrowError variant name (e.g. InvalidAmount, OverFunded)' },
+          code: { type: 'integer', description: 'Numeric contract error code (1..16)' },
+        },
+      },
+      TxStatusResponse: {
+        type: 'object',
+        required: ['hash', 'status', 'ledger', 'createdAt', 'function', 'returnValue'],
+        properties: {
+          hash: { type: 'string', pattern: '^[0-9a-f]{64}$' },
+          status: { type: 'string', enum: ['PENDING', 'SUCCESS', 'FAILED', 'NOT_FOUND'] },
+          ledger: { type: 'integer', nullable: true },
+          createdAt: { oneOf: [{ type: 'integer' }, { type: 'string' }], nullable: true },
+          function: { type: 'string', nullable: true },
+          returnValue: {
+            nullable: true,
+            description: 'Decoded native return value via scValToNative (bigints serialized as strings)',
+          },
+          contractError: { $ref: '#/components/schemas/ContractError' },
+        },
+      },
       OnChainStatus: {
         type: 'object',
         description: 'Live escrow contract state read from the Soroban RPC (cached, degrades gracefully).',

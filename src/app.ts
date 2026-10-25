@@ -18,6 +18,7 @@ import {
 } from './store';
 import { openapi, docsHtml } from './openapi';
 import { PauseGuard } from './pauseGuard';
+import { TxRelay } from './tx';
 import { type ChainReader as ChainStatusReader, createStellarChainReader } from './stellar/chain-status';
 import { ERRORS, PROBLEM_TYPE_BASE, isErrorKey } from './errors';
 import { validate } from './validation/middleware';
@@ -343,6 +344,8 @@ export type AppDeps = {
   pauseGuard?: PauseGuard;
   /** Live contract status for GET /api/v1/chain; defaults to the cached Soroban RPC reader. */
   chainStatusReader?: ChainStatusReader;
+  /** Relays signed escrow transactions to Soroban RPC (POST /api/v1/tx/submit). */
+  txRelay?: TxRelay;
 };
 
 /**
@@ -389,20 +392,22 @@ export interface AppOptions {
 
 export function createApp(
   storeOrOpts: EscrowStore | AppDeps = new EscrowStore().seed(),
-  fallbackChainReaderOrReceiptManager?: ChainReader | ReceiptManager,
+  fallbackChainReaderOrReceiptManager?: ChainReader | ReceiptManager | TxRelay,
   options: AppOptions = {},
 ) {
   const resolved = resolveStoreAndLogger(storeOrOpts);
   const store = resolved.store;
   const logger = resolved.logger;
   const second = fallbackChainReaderOrReceiptManager;
-  const chainReader = second instanceof ReceiptManager ? resolved.chainReader : (second ?? resolved.chainReader);
+  const chainReader =
+    second instanceof ReceiptManager || second instanceof TxRelay ? resolved.chainReader : (second ?? resolved.chainReader);
   const txRpcServer = resolved.txRpcServer;
   const isDeps = !(storeOrOpts && typeof (storeOrOpts as EscrowStore).list === 'function');
   const deps: AppDeps = isDeps ? ((storeOrOpts as AppDeps | undefined) ?? {}) : {};
   const auth = resolveAuth(deps);
   const pauseGuard = deps.pauseGuard ?? new PauseGuard();
   let chainStatusReader = deps.chainStatusReader;
+  const txRelay = second instanceof TxRelay ? second : (deps.txRelay ?? new TxRelay());
   const chainStatus = () => (chainStatusReader ??= createStellarChainReader());
   /** 503 for mutations whose Soroban counterparts call require_not_paused. */
   const requireNotPaused = async (_req: Request, res: Response, next: NextFunction) => {
@@ -572,6 +577,9 @@ export function createApp(
         'GET  /api/v1/reputation',
         'GET  /api/v1/reputation/:address',
         'GET  /api/v1/reputation/:address/reviews',
+        'POST /api/v1/tx/submit',
+        'GET  /api/v1/tx',
+        'GET  /api/v1/tx/:hash',
         'POST /api/v1/templates',
         'GET  /api/v1/templates',
         'GET  /api/v1/templates/:id',
@@ -1016,6 +1024,55 @@ export function createApp(
         }
       }
       return { valid: true, kid: verified.kid, iat: verified.iat, contractId: verified.contractId, matchesCurrent };
+    }),
+  );
+
+  // --- Signed transaction relay ---
+  const HEX64_RE = /^[0-9a-fA-F]{64}$/;
+  v1.post(
+    '/tx/submit',
+    wrap(async (req, res) => {
+      const result = await txRelay.submit(req.body?.xdr);
+      if (result.retryAfter !== undefined) res.setHeader('Retry-After', String(result.retryAfter));
+      res.status(result.httpStatus).json(result.body);
+    }),
+  );
+  v1.get('/tx', wrap((req) => ({ data: txRelay.listRecent(req.query.limit) })));
+  v1.get(
+    '/tx/:hash',
+    wrap(async (req, res) => {
+      const hash = req.params.hash;
+      if (!HEX64_RE.test(hash)) {
+        throw new HttpError(400, 'invalid_hash', 'Transaction hash must be a 64-character hex string');
+      }
+      const waitParam = req.query.wait;
+      if (waitParam !== 'true' && waitParam !== '1') return txRelay.getStatus(hash);
+
+      // Long-poll: stop polling as soon as the client goes away.
+      let disconnected = false;
+      const listeners = new Set<() => void>();
+      const onClose = () => {
+        if (res.writableEnded) return;
+        disconnected = true;
+        for (const cb of listeners) cb();
+      };
+      req.on('aborted', onClose);
+      res.on('close', onClose);
+      try {
+        const result = await txRelay.getStatusWithWait(
+          hash,
+          () => disconnected || req.destroyed,
+          (cb) => {
+            listeners.add(cb);
+            return () => listeners.delete(cb);
+          },
+        );
+        if (!disconnected && !res.headersSent) res.json(result);
+      } finally {
+        req.off('aborted', onClose);
+        res.off('close', onClose);
+      }
+      return undefined;
     }),
   );
 
